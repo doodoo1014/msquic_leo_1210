@@ -1,6 +1,7 @@
 /*
-    CubicBoost V12.1: Bootstrap Acceleration & Robust Elasticity
-    - Fix: Undeclared 'Connection' identifier compilation error.
+    CubicBoost V13.1: Fix Compilation Error (Settings undeclared)
+    - Fix: Retrieved 'Settings' from 'Connection' object in Reset function.
+    - Includes all V13 features: Aggressive Scaling & Burst Growth.
 */
 
 #include "precomp.h"
@@ -102,10 +103,9 @@ CubicProbePktsAcked(
         (double)CongestionThreshold / 1000.0,
         CubicProbe->IsQueueBuilding);
 
-    // 3. Elasticity Calculation (Improved Batching)
+    // 3. Elasticity Calculation
     CubicProbe->BatchBytesAcked += AckEvent->NumRetransmittableBytes;
     
-    // BatchThreshold: 약 1/8 CWND (너무 작으면 DeltaCwnd가 0이 됨)
     uint32_t BatchThreshold = Cubic->CongestionWindow / 8;
     if (BatchThreshold < DatagramPayloadLength * 2) BatchThreshold = DatagramPayloadLength * 2;
 
@@ -119,17 +119,15 @@ CubicProbePktsAcked(
 
         if (CubicProbe->PrevBandwidth > 0 && CubicProbe->PrevCwnd > 0) {
             
-            // CWND가 실제로 변했을 때만 탄력성을 계산 (0으로 나누기 방지)
             if (CurrentCwnd > CubicProbe->PrevCwnd) {
                 double DeltaBwPct = (double)((int64_t)CurrentBandwidth - (int64_t)CubicProbe->PrevBandwidth) / (double)CubicProbe->PrevBandwidth;
                 double DeltaCwndPct = (double)((int64_t)CurrentCwnd - (int64_t)CubicProbe->PrevCwnd) / (double)CubicProbe->PrevCwnd;
 
                 if (DeltaCwndPct > 0.0001) { 
                     double NewElasticity = DeltaBwPct / DeltaCwndPct;
-                    if (NewElasticity > 1.0) NewElasticity = 1.0;
+                    if (NewElasticity > 2.0) NewElasticity = 2.0; 
                     if (NewElasticity < 0.0) NewElasticity = 0.0;
 
-                    // EWMA
                     CubicProbe->CurrentElasticity = (0.75 * CubicProbe->CurrentElasticity) + (0.25 * NewElasticity);
 
                     printf("[CubicProbe][%p][%.3fms] E-Update: E=%.2f (Raw=%.2f, dCwnd=%.4f)\n",
@@ -138,7 +136,6 @@ CubicProbePktsAcked(
             } 
         }
 
-        // 스냅샷 갱신
         CubicProbe->PrevBandwidth = CurrentBandwidth;
         CubicProbe->PrevCwnd = CurrentCwnd;
         CubicProbe->PrevTime = TimeNow;
@@ -204,27 +201,21 @@ CubicProbeUpdate(
         N_cubic = 100 * (Cubic->CongestionWindow / DatagramPayloadLength);
     }
 
-    // --- Part 2: Physics Blending & Bootstrap ---
+    // --- Part 2: Aggressive Boost ---
     double E = CubicProbe->CurrentElasticity;
     
     if (CubicProbe->IsQueueBuilding) {
-        // [Veto] 큐가 쌓이면 가속 중단 (순정 CUBIC)
+        // [Veto On] Safety mode
         E = 0.0;
+        *AckTarget = N_cubic;
     } 
     else {
-        // [Bootstrap Logic]
-        // 큐가 쌓이지 않았는데(Veto=0) E가 0이라면, 아직 탐색을 안 해본 것임.
-        // 강제로 E를 높여서 가속을 유발해야, CWND가 늘어나고, 그래야 Elasticity가 측정됨.
-        if (E < 0.5) {
-            E = 0.5; // "최소한 2배 가속" (N_target을 절반으로)
-        }
-    }
+        // [Veto Off] Clear path detected!
+        if (E < 0.5) E = 0.5; // Bootstrap
 
-    // Blending Formula
-    double BlendedTarget = (1.0 - E) * (double)N_cubic + (E * 1.0);
-    
-    *AckTarget = (uint32_t)BlendedTarget;
-    if (*AckTarget < 1) *AckTarget = 1;
+        *AckTarget = 2; // Aggressive Scaling
+        if (E > 0.8) *AckTarget = 1;
+    }
 
     // [LOG] Acceleration Info
     if (*AckTarget < N_cubic) {
@@ -248,20 +239,22 @@ CubicProbeIncreaseWindow(
     uint32_t AckedSegments = (AckEvent->NumRetransmittableBytes + DatagramPayloadLength - 1) / DatagramPayloadLength;
     CubicProbe->AckCountForGrowth += AckedSegments;
 
-    // [핵심] AckTarget만큼 ACK가 모이면 CWND 1 증가
+    // Burst Growth Fix
     if (CubicProbe->AckCountForGrowth >= AckTarget) {
+        
+        uint32_t GrowthSegments = CubicProbe->AckCountForGrowth / AckTarget;
         uint32_t PrevCwnd = Cubic->CongestionWindow;
         
-        Cubic->CongestionWindow += DatagramPayloadLength;
-        CubicProbe->AckCountForGrowth -= AckTarget;
+        Cubic->CongestionWindow += (GrowthSegments * DatagramPayloadLength);
+        CubicProbe->AckCountForGrowth %= AckTarget;
 
-        printf("[CubicProbe][%p][%.3fms] CWND Update (Avoidance/Boost): %u -> %u (Target=%u, E=%.2f)\n",
+        printf("[CubicProbe][%p][%.3fms] CWND Update (Boost): %u -> %u (Target=%u, Growth=%u segs)\n",
             (void*)Connection, 
             (double)AckEvent->TimeNow / 1000.0, 
             PrevCwnd, 
             Cubic->CongestionWindow, 
             AckTarget,
-            CubicProbe->CurrentElasticity);
+            GrowthSegments);
     }
 }
 
@@ -284,12 +277,16 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 void CubicProbeCongestionControlReset(_In_ QUIC_CONGESTION_CONTROL* Cc, _In_ BOOLEAN FullReset) {
     QUIC_CONGESTION_CONTROL_CUBICPROBE* CubicProbe = &Cc->CubicProbe;
     QUIC_CONGESTION_CONTROL_CUBIC* Cubic = &CubicProbe->Cubic;
-    // [Fix] Connection 선언 추가
     QUIC_CONNECTION* Connection = QuicCongestionControlGetConnection(Cc);
+    // [Fix] Retrieve Settings from Connection
+    const QUIC_SETTINGS_INTERNAL* Settings = &Connection->Settings;
+    
     const QUIC_PATH* Path = &Connection->Paths[0];
     const uint16_t DatagramPayloadLength = QuicPathGetDatagramPayloadSize(Path);
 
     Cubic->SlowStartThreshold = UINT32_MAX;
+    Cubic->SendIdleTimeoutMs = Settings->SendIdleTimeoutMs;
+    Cubic->InitialWindowPackets = Settings->InitialWindowPackets;
     Cubic->CongestionWindow = DatagramPayloadLength * Cubic->InitialWindowPackets;
     Cubic->BytesInFlightMax = Cubic->CongestionWindow / 2;
     if (FullReset) Cubic->BytesInFlight = 0;
