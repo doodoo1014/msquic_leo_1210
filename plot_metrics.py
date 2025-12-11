@@ -165,6 +165,7 @@ def plot_network_metrics(server_data, client_data, output_filename="network_anal
     ax1.set_ylabel("CWND (Bytes)", fontsize=12)
     if has_cwnd: ax1.legend(loc='upper right')
     ax1.grid(True, linestyle='--', alpha=0.7)
+    ax1.set_ylim(bottom=0, top=3000000)
 
     # --- 2. RTT (Server & Client Mix) ---
     # 서버측 RTT

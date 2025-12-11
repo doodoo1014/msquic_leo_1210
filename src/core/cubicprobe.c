@@ -1,11 +1,8 @@
 /*
-    CubicBoost V18 Final: Logic Fixed & Compilation Errors Resolved
-    - Fixed: Replaced 'CubicProbePktsAcked' call with 'CheckSafety' & 'CheckElasticity'.
-    - Fixed: Unused variable/parameter warnings.
-    - Logic: 
-        1. Elasticity (E) per Round (10% BW increase => E=1.0).
-        2. Safety (Veto) per ACK (RTT Spike => Veto=1).
-        3. Target = Safe ? (1-E)*N_cubic + E*1 : N_cubic.
+    CubicBoost V20: Cumulative Elasticity (Fixing Low E issue)
+    - Logic: Compare current metrics against 'Epoch Baseline' (start of congestion avoidance),
+             instead of the immediate previous round.
+    - Benefit: Accumulates small changes over time to detect meaningful elasticity.
 */
 
 #include "precomp.h"
@@ -18,7 +15,6 @@
 
 #define TEN_TIMES_BETA_CUBIC 7  
 #define TEN_TIMES_C_CUBIC 4     
-
 #define PROBE_SENSITIVITY_GAMMA 4       
 #define PROBE_MIN_NOISE_MARGIN_US 4000  
 
@@ -53,17 +49,17 @@ static void CubicProbeResetPhysicsState(_In_ QUIC_CONGESTION_CONTROL_CUBICPROBE*
     CubicProbe->RoundInFlightBytes = 0;
     CubicProbe->RoundStartTime = CxPlatTimeUs64();
     
-    // Metrics
-    CubicProbe->PrevBandwidth = 0;
-    CubicProbe->CurrentElasticity = 0.0;
+    // [New] Epoch Baselines (누적 계산을 위한 기준점)
+    CubicProbe->EpochStartBandwidth = 0;
+    CubicProbe->EpochStartCwnd = 0;
     
-    // Control Flags
+    CubicProbe->CurrentElasticity = 0.0;
     CubicProbe->IsQueueBuilding = FALSE;
     CubicProbe->AckCountForGrowth = 0;
 }
 
 // =========================================================================
-// Logic 1: Safety Check (Per ACK)
+// Logic 1: Safety Check & RTT (Per ACK)
 // =========================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -77,14 +73,12 @@ CubicProbeCheckSafety(
     QUIC_CONNECTION* Connection = QuicCongestionControlGetConnection(Cc);
     const QUIC_PATH* Path = &Connection->Paths[0];
 
-    // 1. MinRTT Update
     if (AckEvent->MinRttValid) {
         if (CubicProbe->MinRttUs == UINT64_MAX || AckEvent->MinRtt < CubicProbe->MinRttUs) {
             CubicProbe->MinRttUs = AckEvent->MinRtt;
         }
     }
 
-    // 2. Statistical Veto
     CubicProbe->RttVariance = Path->RttVariance; 
     uint64_t NoiseMargin = PROBE_SENSITIVITY_GAMMA * CubicProbe->RttVariance;
     if (NoiseMargin < PROBE_MIN_NOISE_MARGIN_US) NoiseMargin = PROBE_MIN_NOISE_MARGIN_US;
@@ -94,16 +88,19 @@ CubicProbeCheckSafety(
 
     if (AckEvent->MinRtt > Threshold) {
         CubicProbe->IsQueueBuilding = TRUE; 
+        
+        // [Important] If queue is building, reset the Epoch Baseline.
+        // We want to measure elasticity only during "clean" intervals.
+        CubicProbe->EpochStartBandwidth = 0; 
     } else {
         CubicProbe->IsQueueBuilding = FALSE; 
     }
 
-    // Accumulate bytes for Round measurement
     CubicProbe->RoundInFlightBytes += AckEvent->NumRetransmittableBytes;
 }
 
 // =========================================================================
-// Logic 2: Elasticity Check (Per Round)
+// Logic 2: Cumulative Elasticity Check (Per Round)
 // =========================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -114,9 +111,9 @@ CubicProbeCheckElasticity(
     )
 {
     QUIC_CONGESTION_CONTROL_CUBICPROBE* CubicProbe = &Cc->CubicProbe;
+    QUIC_CONGESTION_CONTROL_CUBIC* Cubic = &CubicProbe->Cubic;
     QUIC_CONNECTION* Connection = QuicCongestionControlGetConnection(Cc);
 
-    // Check Round Completion
     if (AckEvent->LargestAck >= CubicProbe->ProbeTargetPacketNumber) {
         
         uint64_t TimeNow = AckEvent->TimeNow;
@@ -126,32 +123,51 @@ CubicProbeCheckElasticity(
         if (TimeDelta > 0) {
             CurrentBW = CubicProbe->RoundInFlightBytes * 1000000 / TimeDelta;
         }
+        uint32_t CurrentCwnd = Cubic->CongestionWindow;
 
-        double NewElasticity = 0.0;
-
-        if (CubicProbe->PrevBandwidth > 0) {
-            if (CurrentBW > CubicProbe->PrevBandwidth) {
-                // Ratio calculation
-                double Ratio = (double)(CurrentBW - CubicProbe->PrevBandwidth) / (double)CubicProbe->PrevBandwidth;
+        // [Epoch Initialization]
+        // If we don't have a baseline yet (start of connection or after congestion), set it.
+        if (CubicProbe->EpochStartBandwidth == 0 || CubicProbe->EpochStartCwnd == 0) {
+            CubicProbe->EpochStartBandwidth = CurrentBW;
+            CubicProbe->EpochStartCwnd = CurrentCwnd;
+            CubicProbe->CurrentElasticity = 0.0;
+        } 
+        else {
+            // [Cumulative Calculation]
+            // Calculate growth relative to the START of the epoch, not just previous round.
+            
+            // Prevent division by zero
+            if (CubicProbe->EpochStartBandwidth > 0 && CubicProbe->EpochStartCwnd > 0) {
                 
-                // 10% increase => E=1.0
-                NewElasticity = Ratio * 10.0;
-                if (NewElasticity > 1.0) NewElasticity = 1.0;
-            } else {
-                NewElasticity = 0.0;
+                double BwGrowth = (double)((int64_t)CurrentBW - (int64_t)CubicProbe->EpochStartBandwidth) / (double)CubicProbe->EpochStartBandwidth;
+                double CwndGrowth = (double)((int64_t)CurrentCwnd - (int64_t)CubicProbe->EpochStartCwnd) / (double)CubicProbe->EpochStartCwnd;
+
+                // Only update E if we have pushed CWND enough (> 2%) to measure a reaction
+                if (CwndGrowth > 0.02) {
+                    double NewE = BwGrowth / CwndGrowth;
+                    
+                    // Allow E to go slightly above 1.0 due to noise, but clamp for logic
+                    if (NewE > 1.0) NewE = 1.0;
+                    if (NewE < 0.0) NewE = 0.0;
+                    
+                    CubicProbe->CurrentElasticity = NewE;
+                }
             }
         }
-
-        CubicProbe->CurrentElasticity = NewElasticity;
         
-        if (CubicProbe->CurrentElasticity > 0.01) {
-            printf("[CubicProbe][%p][%.3fms] Round Stats: E=%.2f, Veto=%d, BW=%lu (Prev=%lu)\n", 
-                (void*)Connection, (double)TimeNow/1000.0, 
-                CubicProbe->CurrentElasticity, CubicProbe->IsQueueBuilding, CurrentBW, CubicProbe->PrevBandwidth);
+        // [Baseline Reset Condition]
+        // If BW dropped significantly below baseline, reset the epoch (re-calibration).
+        if (CurrentBW < CubicProbe->EpochStartBandwidth * 0.9) {
+            CubicProbe->EpochStartBandwidth = CurrentBW;
+            CubicProbe->EpochStartCwnd = CurrentCwnd;
+        }
+
+        if (CubicProbe->CurrentElasticity > 0.1) {
+            printf("[Round] E=%.2f, CurrBW=%lu (BaseBW=%lu)\n", 
+                CubicProbe->CurrentElasticity, CurrentBW, CubicProbe->EpochStartBandwidth);
         }
 
         // Reset for Next Round
-        CubicProbe->PrevBandwidth = CurrentBW;
         CubicProbe->RoundInFlightBytes = 0;
         CubicProbe->RoundStartTime = TimeNow;
         CubicProbe->ProbeTargetPacketNumber = Connection->Send.NextPacketNumber; 
@@ -159,7 +175,7 @@ CubicProbeCheckElasticity(
 }
 
 // =========================================================================
-// Logic 3: Target Calculation (Scenario-based Mixing)
+// Logic 3: Target Calculation
 // =========================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -174,7 +190,7 @@ CubicProbeUpdate(
     QUIC_CONGESTION_CONTROL_CUBICPROBE* CubicProbe = &Cc->CubicProbe;
     QUIC_CONGESTION_CONTROL_CUBIC* Cubic = &CubicProbe->Cubic;
 
-    // --- 1. Standard CUBIC (N_cubic) ---
+    // --- Standard CUBIC ---
     if (Cubic->TimeOfCongAvoidStart == 0) {
         Cubic->TimeOfCongAvoidStart = AckEvent->TimeNow;
         if (Cubic->CongestionWindow < Cubic->WindowMax) {
@@ -193,16 +209,15 @@ CubicProbeUpdate(
         }
     }
 
-    const uint32_t W_max_bytes = Cubic->WindowMax;
     const uint64_t t_us = CxPlatTimeDiff64(Cubic->TimeOfCongAvoidStart, AckEvent->TimeNow);
     int64_t TimeDeltaMs = (int64_t)(t_us / 1000) - (int64_t)Cubic->KCubic;
     int64_t CubicTerm = ((((TimeDeltaMs * TimeDeltaMs) >> 10) * TimeDeltaMs * (int64_t)(DatagramPayloadLength * TEN_TIMES_C_CUBIC / 10)) >> 20);
 
     uint32_t W_cubic_bytes;
     if (TimeDeltaMs < 0) {
-        W_cubic_bytes = W_max_bytes - (uint32_t)(-CubicTerm);
+        W_cubic_bytes = Cubic->WindowMax - (uint32_t)(-CubicTerm);
     } else {
-        W_cubic_bytes = W_max_bytes + (uint32_t)CubicTerm;
+        W_cubic_bytes = Cubic->WindowMax + (uint32_t)CubicTerm;
     }
 
     uint32_t N_cubic;
@@ -215,29 +230,40 @@ CubicProbeUpdate(
         N_cubic = 100 * (Cubic->CongestionWindow / DatagramPayloadLength); 
     }
 
-    // --- 2. Scenario-based Logic ---
-    
-    // Case: Unsafe (Queue Building) -> CUBIC Only
+    // --- Boost Logic ---
     if (CubicProbe->IsQueueBuilding) {
-        *AckTarget = N_cubic; 
+        *AckTarget = N_cubic; // Safety First
     }
-    // Case: Safe (Stable RTT) -> Mix CUBIC & SlowStart
     else {
         double E = CubicProbe->CurrentElasticity;
-        uint32_t N_ss = 1; // Slow Start Reference
         
-        // Formula: Target = (1-E)*N_cubic + E*N_ss
-        double TargetDouble = ((1.0 - E) * (double)N_cubic) + (E * (double)N_ss);
+        // [Deterministic] If Elasticity is unknown (0), perform minimum linear growth (Reno)
+        // to accumulate enough CWND change for the next Epoch calculation.
+        if (E < 0.1) {
+            uint32_t N_reno = Cubic->CongestionWindow / DatagramPayloadLength;
+            if (N_reno < 1) N_reno = 1;
+            
+            // Use Linear Growth (Reno) as the baseline for probing
+            // This is faster than CUBIC plateau, ensuring we get dCWND > 0.02 soon.
+            *AckTarget = N_reno; 
+        } 
+        else {
+            // Linear Interpolation: 
+            // Target = (1-E)*N_cubic + E*1(SlowStart)
+            // But since N_cubic can be huge, we cap the baseline at Reno to ensure responsiveness.
+            
+            uint32_t N_baseline = Cubic->CongestionWindow / DatagramPayloadLength; // Reno
+            if (N_baseline > N_cubic) N_baseline = N_cubic; // Respect CUBIC if it's faster
+
+            double TargetDouble = ((1.0 - E) * (double)N_baseline) + (E * 1.0);
+            *AckTarget = (uint32_t)TargetDouble;
+        }
         
-        *AckTarget = (uint32_t)TargetDouble;
-        
-        if (*AckTarget > N_cubic) *AckTarget = N_cubic;
         if (*AckTarget < 1) *AckTarget = 1;
     }
 
     if (*AckTarget < N_cubic && !CubicProbe->IsQueueBuilding) {
-        // Only log when actually boosting
-        // printf("[Boost] N_cubic=%u -> Target=%u (E=%.2f)\n", N_cubic, *AckTarget, CubicProbe->CurrentElasticity);
+        // printf("[Boost] N=%u -> Tgt=%u (E=%.2f)\n", N_cubic, *AckTarget, CubicProbe->CurrentElasticity);
     }
 }
 
@@ -265,12 +291,13 @@ CubicProbeIncreaseWindow(
         Cubic->CongestionWindow += (GrowthSegments * DatagramPayloadLength);
         CubicProbe->AckCountForGrowth %= AckTarget;
 
-        printf("[CubicProbe][%p][%.3fms] CWND Update (Avoidance/Boost): %u -> %u (Target=%u, E=%.2f)\n",
+        printf("[CubicProbe][%p][%.3fms] CWND+: %u -> %u (Tgt=%u, Grow=%u, E=%.2f)\n",
             (void*)Connection, 
             (double)AckEvent->TimeNow / 1000.0, 
             PrevCwnd, 
             Cubic->CongestionWindow, 
             AckTarget,
+            GrowthSegments,
             CubicProbe->CurrentElasticity);
     }
 }
@@ -306,14 +333,13 @@ void CubicProbeCongestionControlReset(_In_ QUIC_CONGESTION_CONTROL* Cc, _In_ BOO
     Cubic->InitialWindowPackets = Settings->InitialWindowPackets;
     Cubic->CongestionWindow = DatagramPayloadLength * Cubic->InitialWindowPackets;
     Cubic->BytesInFlightMax = Cubic->CongestionWindow / 2;
-    Cubic->BytesInFlight = 0; 
+    if (FullReset) Cubic->BytesInFlight = 0;
     Cubic->WindowMax = 0; 
     
     CubicProbe->MinRttUs = UINT64_MAX;
     CubicProbeResetPhysicsState(CubicProbe);
     
-    printf("[CubicProbe][%p][%.3fms] Initialized. InitialCWND=%u\n", 
-        (void*)Connection, (double)CxPlatTimeUs64()/1000.0, Cubic->CongestionWindow);
+    printf("[Init] CubicBoost V20 (Cumulative). CWND=%u\n", Cubic->CongestionWindow);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -367,49 +393,44 @@ BOOLEAN CubicProbeCongestionControlOnDataAcknowledged(_In_ QUIC_CONGESTION_CONTR
         if (AckEvent->LargestAck > Cubic->RecoverySentPacketNumber) {
             Cubic->IsInRecovery = FALSE;
             
-            // [Log] Recovery Exit
-            printf("[CubicProbe][%p][%.3fms] RECOVERY EXIT. CWND=%u\n", 
-                (void*)Connection, (double)AckEvent->TimeNow/1000.0, Cubic->CongestionWindow);
-            
-            // Start new Round immediately
+            // [Fix] Start new Epoch on Recovery Exit
             CubicProbe->ProbeTargetPacketNumber = Connection->Send.NextPacketNumber;
             CubicProbe->RoundStartTime = AckEvent->TimeNow;
-            CubicProbe->RoundInFlightBytes = 0;
+            CubicProbe->EpochStartBandwidth = 0; // Reset Epoch
+            CubicProbe->EpochStartCwnd = 0;
+            
+            printf("[Recovery] Exit. CWND=%u\n", Cubic->CongestionWindow);
         }
         goto Exit;
     }
     if (AckEvent->NumRetransmittableBytes == 0) goto Exit;
 
     if (Cubic->CongestionWindow < Cubic->SlowStartThreshold) {
-        // Slow Start
+        // Slow Start Phase
         uint32_t PrevCwnd = Cubic->CongestionWindow;
         Cubic->CongestionWindow += AckEvent->NumRetransmittableBytes;
 
-        // [Log] Slow Start Update
         printf("[CubicProbe][%p][%.3fms] CWND Update (SlowStart): %u -> %u\n",
             (void*)Connection, (double)AckEvent->TimeNow / 1000.0, PrevCwnd, Cubic->CongestionWindow);
 
         if (Cubic->CongestionWindow >= Cubic->SlowStartThreshold) {
             Cubic->TimeOfCongAvoidStart = AckEvent->TimeNow;
             
-            // Initialize Round Tracking on Exit SS
+            // Initialize Tracking on Exit SS
             CubicProbe->ProbeTargetPacketNumber = Connection->Send.NextPacketNumber;
             CubicProbe->RoundStartTime = AckEvent->TimeNow;
             CubicProbe->RoundInFlightBytes = 0;
+            CubicProbe->EpochStartBandwidth = 0;
         }
     } else {
-        // Congestion Avoidance
+        // Congestion Avoidance Phase
         const QUIC_PATH* Path = &Connection->Paths[0];
         const uint16_t DatagramPayloadLength = QuicPathGetDatagramPayloadSize(Path);
         if (DatagramPayloadLength == 0) goto Exit;
 
-        // 1. Safety Check (Per ACK)
         CubicProbeCheckSafety(Cc, AckEvent);
-        
-        // 2. Elasticity Check (Per Round)
-        CubicProbeCheckElasticity(Cc, AckEvent);
+        CubicProbeCheckElasticity(Cc, AckEvent); // Cumulative Check
 
-        // 3. Update & Increase
         uint32_t AckTarget = 0;
         CubicProbeUpdate(Cc, AckEvent, DatagramPayloadLength, &AckTarget);
         CubicProbeIncreaseWindow(Cc, AckEvent, AckTarget, DatagramPayloadLength);
@@ -465,8 +486,7 @@ static void CubicProbeCongestionControlOnCongestionEvent(_In_ QUIC_CONGESTION_CO
     Cubic->SlowStartThreshold = Cubic->CongestionWindow = CXPLAT_MAX(MinCongestionWindow, (uint32_t)(Cubic->CongestionWindow * ((double)TenTimesBeta / 10.0)));
     Cubic->TimeOfCongAvoidStart = 0;
 
-    printf("[CubicProbe][%p][%.3fms] CWND Update (Congestion Event): %u -> %u (Beta=%.1f)\n",
-        (void*)Connection, (double)CxPlatTimeUs64() / 1000.0, PrevCwnd, Cubic->CongestionWindow, (double)TenTimesBeta/10.0);
+    printf("[LOSS] Event. CWND: %u -> %u\n", PrevCwnd, Cubic->CongestionWindow);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -573,6 +593,7 @@ void CubicProbeCongestionControlInitialize(_In_ QUIC_CONGESTION_CONTROL* Cc, _In
     *Cc = QuicCongestionControlCubicProbe;
     QUIC_CONGESTION_CONTROL_CUBICPROBE* CubicProbe = &Cc->CubicProbe;
     QUIC_CONGESTION_CONTROL_CUBIC* Cubic = &CubicProbe->Cubic;
+    // [Fix] Declare Connection here
     QUIC_CONNECTION* Connection = QuicCongestionControlGetConnection(Cc);
     const QUIC_PATH* Path = &Connection->Paths[0];
     const uint16_t DatagramPayloadLength = QuicPathGetDatagramPayloadSize(Path);
@@ -588,6 +609,5 @@ void CubicProbeCongestionControlInitialize(_In_ QUIC_CONGESTION_CONTROL* Cc, _In
     CubicProbe->MinRttUs = UINT64_MAX;
     CubicProbeResetPhysicsState(CubicProbe);
     
-    printf("[CubicProbe][%p][%.3fms] Initialized. InitialCWND=%u\n", 
-        (void*)Connection, (double)CxPlatTimeUs64()/1000.0, Cubic->CongestionWindow);
+    printf("[Init] CubicBoost V20 (Cumulative). CWND=%u\n", Cubic->CongestionWindow);
 }

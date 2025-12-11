@@ -1,6 +1,6 @@
 /*
     cubicprobe.h - Physics-based CubicBoost Header
-    - Updated for V17 (Round-Trip Logic)
+    - Updated for V20 (Cumulative Elasticity)
 */
 
 #ifndef QUIC_CUBICPROBE_H
@@ -17,18 +17,31 @@ typedef struct QUIC_CONGESTION_CONTROL_CUBICPROBE {
     uint64_t MinRttUs;          
     uint64_t RttVariance;       
     
-    // 3. Round-Trip Logic (New Members for V17)
-    uint64_t RoundStartTime;        // Start time of the current round
-    uint64_t RoundInFlightBytes;    // Bytes accumulated in this round
-    uint64_t ProbeTargetPacketNumber; // Packet number that marks end of round
+    // 3. Round-Trip Logic 
+    uint64_t RoundStartTime;        
+    uint64_t RoundInFlightBytes;    
+    uint64_t ProbeTargetPacketNumber; 
     
-    // 4. Elasticity Metrics
-    uint64_t PrevBandwidth;     // Bandwidth of the previous round
-    double   CurrentElasticity; // Calculated E (0.0 ~ 1.0)
+    // 4. Elasticity Metrics (Cumulative)
+    uint64_t PrevBandwidth;      // (구버전 호환용)
+    uint32_t PrevCwnd;           // (구버전 호환용)
+    uint64_t PrevTime;           // (구버전 호환용)
+    
+    // [New] Epoch Baselines for V20
+    uint64_t EpochStartBandwidth; 
+    uint32_t EpochStartCwnd;
+
+    // Accumulator for Batch Processing
+    uint64_t BatchBytesAcked;
+
+    double   CurrentElasticity; 
 
     // 5. Control Flags
-    BOOLEAN  IsQueueBuilding;   // Veto Flag
-    uint32_t AckCountForGrowth; // Accumulator for CWND growth
+    BOOLEAN  IsQueueBuilding;   
+    uint32_t AckCountForGrowth; 
+    
+    // Veto Counter (Optional if used)
+    uint8_t VetoCounter;
 
 } QUIC_CONGESTION_CONTROL_CUBICPROBE;
 
