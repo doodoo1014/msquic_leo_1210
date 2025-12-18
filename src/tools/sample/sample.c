@@ -1715,7 +1715,7 @@ RunClient(
 
     Ctx.LastLogTimeMs = 0;
     Ctx.LastBytesReceived = 0;
-    for (int i = 0; i < 80; ++i) {
+    for (int i = 0; i < 120; ++i) {
         usleep(500000);
         if (Ctx.Connected) {
             if (Ctx.LastLogTimeMs == 0) { // 첫 로그 출력 시점 초기화

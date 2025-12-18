@@ -137,42 +137,121 @@
 
 
 
+// #ifndef QUIC_CUBICPROBE_H
+// #define QUIC_CUBICPROBE_H
+
+// #include "cubic.h" // cubic.h를 포함하여 필요한 타입들을 가져옵니다.
+
+// // CubicProbe의 탐색 상태 Enum
+// typedef enum QUIC_PROBE_STATE {
+//     PROBE_INACTIVE,
+//     PROBE_TEST,
+//     PROBE_WAITING,
+//     PROBE_JUDGMENT
+// } QUIC_PROBE_STATE;
+
+// // CubicProbe 알고리즘의 상태를 저장하는 구조체
+// typedef struct QUIC_CONGESTION_CONTROL_CUBICPROBE {
+
+//     // Base MsQuic CUBIC State.
+//     QUIC_CONGESTION_CONTROL_CUBIC Cubic;
+
+//     // CubicProbe-specific State
+//     QUIC_PROBE_STATE ProbeState;
+//     BOOLEAN HasCrossedWmax;
+//     BOOLEAN HasGrownInThisRound;
+//     uint32_t CumulativeSuccessLevel;
+//     uint64_t RttAtProbeStartUs;
+//     uint64_t RttVarAtProbeStartUs;
+
+//     // **ACK Counter for ns-3 style growth**
+//     // uint32_t AckCountSinceLastGrowth; // ns-3의 m_cWndCnt 역할 (세그먼트 단위)
+//     uint64_t MinRttUs;
+//     uint32_t AckCountForGrowth;
+//     uint64_t ProbeTargetPacketNumber;
+
+// } QUIC_CONGESTION_CONTROL_CUBICPROBE;
+
+// // CubicProbe 알고리즘을 초기화하는 함수
+// _IRQL_requires_max_(DISPATCH_LEVEL)
+// void
+// CubicProbeCongestionControlInitialize(
+//     _In_ QUIC_CONGESTION_CONTROL* Cc,
+//     _In_ const QUIC_SETTINGS_INTERNAL* Settings
+//     );
+
+// #endif // QUIC_CUBICPROBE_H
+
+//20251216
+
+
+
+
+
+
+
+
+
+/*++
+
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License.
+
+Module Name:
+
+    cubicprobe.h
+
+Abstract:
+
+    CubicBoost (v2.1) Congestion Control Algorithm.
+    Features:
+    - Statistical Delay Threshold
+    - Hybrid Acceleration: Pacing (Freq) -> Burst (Size) switching logic.
+    - Full Event Logging.
+
+--*/
+
 #ifndef QUIC_CUBICPROBE_H
 #define QUIC_CUBICPROBE_H
 
-#include "cubic.h" // cubic.h를 포함하여 필요한 타입들을 가져옵니다.
+#include "cubic.h"
 
-// CubicProbe의 탐색 상태 Enum
-typedef enum QUIC_PROBE_STATE {
-    PROBE_INACTIVE,
-    PROBE_TEST,
-    PROBE_WAITING,
-    PROBE_JUDGMENT
-} QUIC_PROBE_STATE;
-
-// CubicProbe 알고리즘의 상태를 저장하는 구조체
+//
+// CubicBoost State
+//
 typedef struct QUIC_CONGESTION_CONTROL_CUBICPROBE {
 
-    // Base MsQuic CUBIC State.
+    // Base CUBIC State
     QUIC_CONGESTION_CONTROL_CUBIC Cubic;
 
-    // CubicProbe-specific State
-    QUIC_PROBE_STATE ProbeState;
-    BOOLEAN HasCrossedWmax;
-    BOOLEAN HasGrownInThisRound;
-    uint32_t CumulativeSuccessLevel;
-    uint64_t RttAtProbeStartUs;
-    uint64_t RttVarAtProbeStartUs;
+    //
+    // Boost Logic State
+    //
 
-    // **ACK Counter for ns-3 style growth**
-    // uint32_t AckCountSinceLastGrowth; // ns-3의 m_cWndCnt 역할 (세그먼트 단위)
-    uint64_t MinRttUs;
+    // 현재의 가속 레벨
+    uint32_t BoostLevel;
+
+    // 현재 RTT Round의 끝을 판단하기 위한 패킷 번호
+    uint64_t RoundEndPacketNumber;
+
+    // Anchor Delay 및 변동성
+    uint64_t AnchorRttUs;
+    uint64_t AnchorRttVarUs;
+
+    // 현재 Round 동안 관측된 최소 RTT
+    uint64_t MinRttInCurrentRoundUs;
+
+    // 1회 성장 시도를 위해 누적된 ACK 수
     uint32_t AckCountForGrowth;
-    uint64_t ProbeTargetPacketNumber;
+
+    // [New] 이번 성장 이벤트에서 한 번에 증가시킬 세그먼트 크기 (기본 1, 초가속 시 > 1)
+    uint32_t CurrentGrowthMagnitude;
+
+    // [Logging] Region 상태
+    BOOLEAN IsConcave;
 
 } QUIC_CONGESTION_CONTROL_CUBICPROBE;
 
-// CubicProbe 알고리즘을 초기화하는 함수
 _IRQL_requires_max_(DISPATCH_LEVEL)
 void
 CubicProbeCongestionControlInitialize(
@@ -181,4 +260,3 @@ CubicProbeCongestionControlInitialize(
     );
 
 #endif // QUIC_CUBICPROBE_H
-

@@ -270,7 +270,7 @@ def parse_server_log(file_path):
     # - CWND UPDATE: 1196057 -> 1197529
     # - CWND+: ...
     # - CWND Update ...
-    cwnd_pattern = re.compile(r"(?:CWND UPDATE|CWND Update|CWND\+).*?:\s*\d+\s*->\s*(\d+)")
+    cwnd_pattern = re.compile(r"(?:CWND UPDATE|CWND Update|CWND\+|CWND Aggregated Update).*?:\s*\d+\s*->\s*(\d+)")
     
     # RTT 패턴:
     # - ROUND DIRTY: RTT(46496) > Thresh(46089)  -> (값은 us 단위로 추정)
