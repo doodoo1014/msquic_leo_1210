@@ -2382,9 +2382,7 @@ CubicProbeUpdate(
     // [Debug] Export BaseAckTarget for Logging
     *BaseAckTargetOut = BaseAckTarget;
 
-    // --- 2. Boost Logic ---
-    
-    // V2.2 Aggressive Scaling: (1 + Level * 10)^2
+    // --- 2. Boost Logic ---    
     uint32_t BoostFactor = 1 + CubicProbe->BoostLevel;
     uint32_t Divisor = BoostFactor * BoostFactor;
     
