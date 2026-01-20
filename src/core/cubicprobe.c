@@ -2385,10 +2385,12 @@ CubicProbeUpdate(
     // --- 2. Boost Logic ---    
     uint32_t BoostFactor = 1 + CubicProbe->BoostLevel;
     uint32_t Divisor = BoostFactor * BoostFactor;
-    
-    uint32_t CalculatedTarget = BaseAckTarget / Divisor;
 
-    if (CalculatedTarget >= 2) {
+    
+    uint32_t CalculatedTarget = BaseAckTarget / BoostFactor;
+    if (!CurrentIsConcave) CalculatedTarget /= BoostFactor;
+
+    if (CurrentIsConcave || CalculatedTarget >= 2) {
         // [Mode 1: Pacing]
         *AckTarget = CalculatedTarget;
         CubicProbe->CurrentGrowthMagnitude = 1;
