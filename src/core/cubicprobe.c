@@ -2366,6 +2366,7 @@ CubicProbeUpdate(
             CurrentIsConcave ? "Concave" : "Convex",
             W_max_bytes);
         CubicProbe->IsConcave = CurrentIsConcave;
+        CubicProbe->BoostLevel = 0;
     }
 
     if (W_cubic_bytes > Cubic->CongestionWindow) {
