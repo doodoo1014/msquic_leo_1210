@@ -2375,9 +2375,10 @@ CubicProbeUpdate(
         uint32_t DiffSegments = TargetSegments > CwndSegments ? TargetSegments - CwndSegments : 1;
         BaseAckTarget = CwndSegments / DiffSegments;
     } 
-    // else {
-    //     BaseAckTarget = 100 * (Cubic->CongestionWindow / DatagramPayloadLength);
-    // }
+    else {
+        if (CubicProbe->BoostLevel > 0) BaseAckTarget = Cubic->CongestionWindow / DatagramPayloadLength;
+        else BaseAckTarget = 100 * (Cubic->CongestionWindow / DatagramPayloadLength);
+    }
     
     if (BaseAckTarget == 0) BaseAckTarget = 1;
     
