@@ -383,6 +383,6 @@ def plot_network_metrics(server_data, output_filename="server_analysis_v2.png"):
     print(f"✅ 그래프 저장 완료: {output_filename}")
 
 if __name__ == "__main__":
-    server_log = "./build/bin/Release/20251231_KOREA_FIRST_TEST_SERVER_client6.txt"
+    server_log = "./build/bin/Release/testserver.txt"
     s_data = parse_server_log(server_log)
     plot_network_metrics(s_data)
